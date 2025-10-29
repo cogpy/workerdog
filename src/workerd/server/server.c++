@@ -2966,6 +2966,11 @@ class Server::WorkerService final: public Service,
         return kj::READY_NOW;
       }
 
+      bool isSynchronous() const override {
+        // Workerd's alarm scheduling is synchronous.
+        return true;
+      }
+
      private:
       AlarmScheduler& alarmScheduler;
       ActorKey actor;

@@ -47,8 +47,7 @@ ActorSqlite::ActorSqlite(kj::Own<SqliteDatabase> dbParam,
       hooks(hooks),
       kv(*db),
       metadata(*db),
-      commitTasks(*this),
-      alarmLaterTasks(alarmLaterErrorHandler) {
+      commitTasks(*this) {
   db->onWrite(KJ_BIND_METHOD(*this, onWrite));
   db->onCriticalError(KJ_BIND_METHOD(*this, onCriticalError));
   lastConfirmedAlarmDbState = metadata.getAlarm();
@@ -336,11 +335,20 @@ ActorSqlite::PrecommitAlarmState ActorSqlite::startPrecommitAlarmScheduling() {
   PrecommitAlarmState state;
   if (pendingCommit == kj::none &&
       willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
-    // Basically, this is the first scheduling request that commitImpl() would make prior to
-    // commitCallback().  We start the request separately, ahead of calling sqlite functions that
-    // commit to local disk, for correctness in workerd, where alarm scheduling and db commits are
-    // both synchronous.
-    state.schedulingPromise = requestScheduledAlarm(metadata.getAlarm());
+    // Capture the alarm time now, before any async operations might change it.
+    auto alarmTime = metadata.getAlarm();
+
+    if (hooks.isSynchronous()) {
+      // In synchronous mode, ignore the alarmLaterChain, since we execute synchronously so there
+      // wouldn't be any pending "move later" alarms to wait for anyways.
+      state.schedulingPromise = requestScheduledAlarm(alarmTime);
+    } else {
+      // In async mode, wait for any pending "move later" operations to complete first.
+      // This prevents a race where a pending delete could overwrite our new earlier alarm at the
+      // alarm manager.
+      state.schedulingPromise = alarmLaterChain.addBranch().then(
+          [this, alarmTime]() { return requestScheduledAlarm(alarmTime); });
+    }
   }
   return kj::mv(state);
 }
@@ -396,20 +404,27 @@ kj::Promise<void> ActorSqlite::commitImpl(ActorSqlite::PrecommitAlarmState preco
   fulfiller->fulfill();
 
   // If the db state is now later than the in-flight scheduled alarms, issue a request to update
-  // it to match the db state.  We don't need to hold open the output gate, so we add the
-  // scheduling request to commitTasks.
+  // it to match the db state. We chain these requests to ensure they execute in order and
+  // prevent races at the alarm manager.
   if (willFireEarlier(alarmScheduledNoLaterThan, alarmStateForCommit)) {
-    alarmLaterTasks.add(requestScheduledAlarm(alarmStateForCommit));
-  }
-}
+    auto updatePromise = [this, alarmStateForCommit]() {
+      return requestScheduledAlarm(alarmStateForCommit).catch_([](kj::Exception&& e) {
+        // If an exception occurs when scheduling the alarm later, it's OK -- the alarm will
+        // eventually fire at the earlier time, and the rescheduling will be retried.
+        // We catch here to prevent the chain from breaking on errors.
+        LOG_WARNING_PERIODICALLY("NOSENTRY SQLite reschedule later alarm failed", e);
+      });
+    };
 
-void ActorSqlite::AlarmLaterErrorHandler::taskFailed(kj::Exception&& exception) {
-  // If an exception occurs when scheduling the alarm later, it's OK -- the alarm will
-  // eventually fire at the earlier time, and the rescheduling will be retried.
-  //
-  // TODO(cleanup): Logging is here for short-term debugging, but could be removed; occasional
-  // alarm scheduling failures are expected during shutdowns or extreme load.
-  LOG_WARNING_PERIODICALLY("NOSENTRY SQLite reschedule later alarm failed", exception);
+    if (hooks.isSynchronous()) {
+      // In sync mode, don't wait for any pending work because there shouldn't be any. We should be
+      // executing everything synchronously, so there's nothing to wait on.
+      alarmLaterChain = updatePromise().fork();
+    } else {
+      // In async mode, chain with existing operations to prevent any racing updates.
+      alarmLaterChain = alarmLaterChain.addBranch().then(kj::mv(updatePromise)).fork();
+    }
+  }
 }
 
 void ActorSqlite::taskFailed(kj::Exception&& exception) {
@@ -852,6 +867,10 @@ void ActorSqlite::TxnCommitRegulator::onError(
 const ActorSqlite::Hooks ActorSqlite::Hooks::DEFAULT = ActorSqlite::Hooks{};
 
 kj::Promise<void> ActorSqlite::Hooks::scheduleRun(kj::Maybe<kj::Date> newAlarmTime) {
+  JSG_FAIL_REQUIRE(Error, "alarms are not yet implemented for SQLite-backed Durable Objects");
+}
+
+bool ActorSqlite::Hooks::isSynchronous() const {
   JSG_FAIL_REQUIRE(Error, "alarms are not yet implemented for SQLite-backed Durable Objects");
 }
 
