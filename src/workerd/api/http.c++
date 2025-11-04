@@ -718,9 +718,11 @@ Body::ExtractedBody Body::extractBody(jsg::Lock& js, Initializer init) {
     }
   }
 
-  auto bodyStream = kj::heap<BodyBufferInputStream>(buffer.clone(js));
+  auto buf = buffer.clone(js);
+  auto memStream = newMemoryInputStream(buf.view, kj::heap(kj::mv(buf.ownBytes)));
+  auto rs = newSystemStream(kj::mv(memStream), StreamEncoding::IDENTITY);
 
-  return {js.alloc<ReadableStream>(IoContext::current(), kj::mv(bodyStream)), kj::mv(buffer),
+  return {js.alloc<ReadableStream>(IoContext::current(), kj::mv(rs)), kj::mv(buffer),
     kj::mv(contentType)};
 }
 
@@ -768,8 +770,9 @@ void Body::rewindBody(jsg::Lock& js) {
 
   KJ_IF_SOME(i, impl) {
     auto bufferCopy = KJ_ASSERT_NONNULL(i.buffer).clone(js);
-    auto bodyStream = kj::heap<BodyBufferInputStream>(kj::mv(bufferCopy));
-    i.stream = js.alloc<ReadableStream>(IoContext::current(), kj::mv(bodyStream));
+    auto memStream = newMemoryInputStream(bufferCopy.view, kj::heap(kj::mv(bufferCopy.ownBytes)));
+    auto rs = newSystemStream(kj::mv(memStream), StreamEncoding::IDENTITY);
+    i.stream = js.alloc<ReadableStream>(IoContext::current(), kj::mv(rs));
   }
 }
 
