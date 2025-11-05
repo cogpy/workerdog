@@ -29,6 +29,7 @@ import {
   type CipherInfo,
   type PublicPrivateCipherOptions,
   type CipherHandle,
+  type AeadHandle,
 } from 'node-internal:crypto';
 
 import {
@@ -80,7 +81,7 @@ export interface AADOptions {
 const kHandle = Symbol('kHandle');
 
 export interface Cipheriv extends Transform {
-  [kHandle]: CipherHandle;
+  [kHandle]: CipherHandle | AeadHandle;
   update(
     data: string | ArrayBuffer | ArrayBufferView,
     inputEncoding?: string,
@@ -96,7 +97,7 @@ export interface Cipheriv extends Transform {
 }
 
 export interface Decipheriv extends Transform {
-  [kHandle]: CipherHandle;
+  [kHandle]: CipherHandle | AeadHandle;
   update(
     data: string | ArrayBuffer | ArrayBufferView,
     inputEncoding?: string,
@@ -172,8 +173,7 @@ export const Cipheriv = function (
   if (options.authLengthTag !== undefined) {
     validateUint32(options.authLengthTag, 'options.authLengthTag');
   }
-
-  this[kHandle] = new cryptoImpl.CipherHandle(
+  this[kHandle] = cryptoImpl.newHandle(
     'cipher',
     algorithm,
     secretKey,
@@ -318,7 +318,7 @@ export const Decipheriv = function (
     validateUint32(options.authLengthTag, 'options.authLengthTag');
   }
 
-  this[kHandle] = new cryptoImpl.CipherHandle(
+  this[kHandle] = cryptoImpl.newHandle(
     'decipher',
     algorithm,
     secretKey,

@@ -107,13 +107,6 @@ export function verifyOneShot(
 ): boolean;
 
 export class CipherHandle {
-  constructor(
-    mode: 'cipher' | 'decipher',
-    algorithm: string,
-    key: CryptoKey,
-    iv: ArrayBuffer | ArrayBufferView,
-    authTagLength?: number
-  );
   update(data: ArrayBuffer | ArrayBufferView): ArrayBuffer;
   final(): ArrayBuffer;
   setAAD(data: ArrayBuffer | ArrayBufferView, plaintextLength?: number): void;
@@ -122,6 +115,22 @@ export class CipherHandle {
   setAuthTag(tag: ArrayBuffer | ArrayBufferView): void;
 }
 
+export class AeadHandle {
+  update(data: ArrayBuffer | ArrayBufferView): ArrayBuffer;
+  final(): ArrayBuffer;
+  setAAD(data: ArrayBuffer | ArrayBufferView, plaintextLength?: number): void;
+  setAutoPadding(autoPadding: boolean): void;
+  getAuthTag(): ArrayBuffer | undefined;
+  setAuthTag(tag: ArrayBuffer | ArrayBufferView): void;
+}
+
+export function newHandle(
+  mode: 'cipher' | 'decipher',
+  algorithm: string,
+  key: CryptoKey,
+  iv: ArrayBuffer | ArrayBufferView,
+  authTagLength?: number
+): CipherHandle | AeadHandle;
 export interface PublicPrivateCipherOptions {
   padding: number;
   oaepHash: string;
