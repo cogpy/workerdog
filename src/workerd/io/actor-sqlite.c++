@@ -309,7 +309,8 @@ void ActorSqlite::onWrite(bool allowUnconfirmed) {
   }
 }
 
-kj::Promise<void> ActorSqlite::requestScheduledAlarm(kj::Maybe<kj::Date> requestedTime) {
+kj::Promise<void> ActorSqlite::requestScheduledAlarm(
+    kj::Maybe<kj::Date> requestedTime, kj::Promise<void> priorTask) {
   // Not using coroutines here, because it's important for correctness in workerd that a
   // synchronously thrown exception in scheduleRun() can escape synchronously to the caller.
 
@@ -324,7 +325,8 @@ kj::Promise<void> ActorSqlite::requestScheduledAlarm(kj::Maybe<kj::Date> request
     alarmScheduledNoLaterThan = requestedTime;
   }
 
-  return hooks.scheduleRun(requestedTime).then([this, movingAlarmLater, requestedTime]() {
+  return hooks.scheduleRun(requestedTime, kj::mv(priorTask))
+      .then([this, movingAlarmLater, requestedTime]() {
     if (!movingAlarmLater) {
       alarmScheduledNoLaterThan = requestedTime;
     }
@@ -338,17 +340,14 @@ ActorSqlite::PrecommitAlarmState ActorSqlite::startPrecommitAlarmScheduling() {
     // Capture the alarm time now, before any async operations might change it.
     auto alarmTime = metadata.getAlarm();
 
-    if (hooks.isSynchronous()) {
-      // In synchronous mode, ignore the alarmLaterChain, since we execute synchronously so there
-      // wouldn't be any pending "move later" alarms to wait for anyways.
-      state.schedulingPromise = requestScheduledAlarm(alarmTime);
-    } else {
-      // In async mode, wait for any pending "move later" operations to complete first.
-      // This prevents a race where a pending delete could overwrite our new earlier alarm at the
-      // alarm manager.
-      state.schedulingPromise = alarmLaterChain.addBranch().then(
-          [this, alarmTime]() { return requestScheduledAlarm(alarmTime); });
-    }
+    // We must wait on the `alarmLaterChain` here, otherwise, if there is a pending "move later"
+    // alarm task and it fails, our "move earlier" alarm might interleave, succeed, and be followed
+    // by a retry of the "move later" alarm. This happens because "move later" alarms complete after
+    // we commit to local SQLite.
+    //
+    // By waiting on any pending "move later" alarm, we correctly serialize our `scheduleRun()`
+    // calls to the alarm manager.
+    state.schedulingPromise = requestScheduledAlarm(alarmTime, alarmLaterChain.addBranch());
   }
   return kj::mv(state);
 }
@@ -386,7 +385,18 @@ kj::Promise<void> ActorSqlite::commitImpl(ActorSqlite::PrecommitAlarmState preco
   // that the successfully scheduled alarm time is always earlier or equal to the alarm state in
   // the successfully persisted db.
   while (willFireEarlier(metadata.getAlarm(), alarmScheduledNoLaterThan)) {
-    co_await requestScheduledAlarm(metadata.getAlarm());
+    // Note that we do not pass alarmLaterChain here. We don't need to for the following reasons:
+    //
+    //  1. We already waited for the chain in the precommitAlarmState promise above.
+    //  2. We set the `pendingCommit` prior to yielding to the event loop earlier, so any subsequent
+    //     commits have to wait for us to fulfill the pendingCommit promise. In short, no one could
+    //     have added another "move-later" alarm to the chain, not until we finish.
+    //
+    // While we *could* pass the alarmLaterChain promise (it wouldn't be incorrect), when calling
+    // addBranch() on a resolved ForkedPromise, the continuation would be evaluated on a future turn
+    // of the event loop. That means we're going to suspend, even if the promise is ready, which
+    // means we'd take a performance hit.
+    co_await requestScheduledAlarm(metadata.getAlarm(), kj::READY_NOW);
   }
 
   // Issue the commitCallback() request to persist the db state, then synchronously clear the
@@ -404,26 +414,21 @@ kj::Promise<void> ActorSqlite::commitImpl(ActorSqlite::PrecommitAlarmState preco
   fulfiller->fulfill();
 
   // If the db state is now later than the in-flight scheduled alarms, issue a request to update
-  // it to match the db state. We chain these requests to ensure they execute in order and
-  // prevent races at the alarm manager.
+  // it to match the db state.
   if (willFireEarlier(alarmScheduledNoLaterThan, alarmStateForCommit)) {
-    auto updatePromise = [this, alarmStateForCommit]() {
-      return requestScheduledAlarm(alarmStateForCommit).catch_([](kj::Exception&& e) {
-        // If an exception occurs when scheduling the alarm later, it's OK -- the alarm will
-        // eventually fire at the earlier time, and the rescheduling will be retried.
-        // We catch here to prevent the chain from breaking on errors.
-        LOG_WARNING_PERIODICALLY("NOSENTRY SQLite reschedule later alarm failed", e);
-      });
-    };
-
-    if (hooks.isSynchronous()) {
-      // In sync mode, don't wait for any pending work because there shouldn't be any. We should be
-      // executing everything synchronously, so there's nothing to wait on.
-      alarmLaterChain = updatePromise().fork();
-    } else {
-      // In async mode, chain with existing operations to prevent any racing updates.
-      alarmLaterChain = alarmLaterChain.addBranch().then(kj::mv(updatePromise)).fork();
-    }
+    // We need to extend our alarmLaterChain now that we're adding a new "move-later" alarm task.
+    //
+    // Technically, we don't need serialize our "move-later" alarms since SQLite has the later
+    // time committed locally. We could just set the `alarmLaterChain` and pass a `kj::READY_NOW`
+    // to requestScheduledAlarm, and so if we have a partial failure we would just recover when
+    // the alarm runs early. That said, it doesn't hurt to serialize on the client-side.
+    alarmLaterChain = requestScheduledAlarm(alarmStateForCommit, alarmLaterChain.addBranch())
+                          .catch_([](kj::Exception&& e) {
+      // If an exception occurs when scheduling the alarm later, it's OK -- the alarm will
+      // eventually fire at the earlier time, and the rescheduling will be retried.
+      // We catch here to prevent the chain from breaking on errors.
+      LOG_WARNING_PERIODICALLY("NOSENTRY SQLite reschedule later alarm failed", e);
+    }).fork();
   }
 }
 
@@ -759,7 +764,21 @@ kj::OneOf<ActorSqlite::CancelAlarmHandler, ActorSqlite::RunAlarmHandler> ActorSq
         LOG_WARNING_PERIODICALLY(
             "NOSENTRY SQLite alarm handler canceled with requestScheduledAlarm.", scheduledTime,
             localAlarmState.orDefault(kj::UNIX_EPOCH), actorId);
-        return CancelAlarmHandler{.waitBeforeCancel = requestScheduledAlarm(localAlarmState)};
+
+        // Since we're requesting to move the alarm time to later, we need to add to our
+        // `alarmLaterChain`. Note that for the chain, we want to make sure any scheduling failure
+        // does not break us, but for the `CancelAlarmHandler`, we want the caller to receive the
+        // exception normally, so we do not consume the exception.
+        auto schedulingPromise =
+            requestScheduledAlarm(localAlarmState, alarmLaterChain.addBranch()).fork();
+        alarmLaterChain = schedulingPromise.addBranch()
+                              .catch_([](kj::Exception&& e) {
+          // If an exception occurs when scheduling the alarm later, it's OK -- the alarm will
+          // eventually fire at the earlier time, and the rescheduling will be retried.
+          // We catch here to prevent the chain from breaking on errors.
+          LOG_WARNING_PERIODICALLY("NOSENTRY SQLite reschedule later alarm failed", e);
+        }).fork();
+        return CancelAlarmHandler{.waitBeforeCancel = schedulingPromise.addBranch()};
       } else {
         // We have a clean local alarm time that is earlier than the handler's scheduled time,
         // which suggests that either the alarm manager is working with stale data or that local
@@ -769,7 +788,11 @@ kj::OneOf<ActorSqlite::CancelAlarmHandler, ActorSqlite::RunAlarmHandler> ActorSq
 
         // Tell the caller to wait for successful rescheduling before cancelling the current
         // handler invocation.
-        return CancelAlarmHandler{.waitBeforeCancel = requestScheduledAlarm(localAlarmState)};
+        //
+        // We pass kj::READY_NOW because being in this branch (SQLite is ahead of the alarm manager)
+        // means there's no recent move-later operation to wait for, so no need for alarmLaterChain.
+        return CancelAlarmHandler{
+          .waitBeforeCancel = requestScheduledAlarm(localAlarmState, kj::READY_NOW)};
       }
     } else {
       // There's a alarm write that hasn't been set yet pending for a time different than ours --
@@ -866,11 +889,8 @@ void ActorSqlite::TxnCommitRegulator::onError(
 
 const ActorSqlite::Hooks ActorSqlite::Hooks::DEFAULT = ActorSqlite::Hooks{};
 
-kj::Promise<void> ActorSqlite::Hooks::scheduleRun(kj::Maybe<kj::Date> newAlarmTime) {
-  JSG_FAIL_REQUIRE(Error, "alarms are not yet implemented for SQLite-backed Durable Objects");
-}
-
-bool ActorSqlite::Hooks::isSynchronous() const {
+kj::Promise<void> ActorSqlite::Hooks::scheduleRun(
+    kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask) {
   JSG_FAIL_REQUIRE(Error, "alarms are not yet implemented for SQLite-backed Durable Objects");
 }
 

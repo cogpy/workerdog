@@ -25,12 +25,11 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
   class Hooks {
    public:
     // Makes a request to the alarm manager to run the alarm handler at the given time, returning
-    // a promise that resolves when the scheduling has succeeded.
-    virtual kj::Promise<void> scheduleRun(kj::Maybe<kj::Date> newAlarmTime);
-
-    // Returns true if alarm scheduling is synchronous (workerd), false if async (production).
-    // When true, alarm operations complete immediately and don't need serialization.
-    virtual bool isSynchronous() const;
+    // a promise that resolves when the scheduling has succeeded. `priorTask` is any work we must
+    // wait on prior to scheduling the new request, as of this writing, this would be the
+    // alarmLaterChain, which holds promises to move the alarm time "later" than is currently set.
+    virtual kj::Promise<void> scheduleRun(
+        kj::Maybe<kj::Date> newAlarmTime, kj::Promise<void> priorTask);
 
     static const Hooks DEFAULT;
 
@@ -246,7 +245,8 @@ class ActorSqlite final: public ActorCacheInterface, private kj::TaskSet::ErrorH
 
   // Issues a request to the alarm scheduler for the given time, returning a promise that resolves
   // when the request is confirmed.
-  kj::Promise<void> requestScheduledAlarm(kj::Maybe<kj::Date> requestedTime);
+  kj::Promise<void> requestScheduledAlarm(
+      kj::Maybe<kj::Date> requestedTime, kj::Promise<void> priorTask);
 
   struct PrecommitAlarmState {
     // Promise for the completion of precommit alarm scheduling
