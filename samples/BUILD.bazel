@@ -1,4 +1,19 @@
 exports_files([
     "helloworld/config.capnp",
     "helloworld/worker.js",
+    
+    # SiliconSage autonomous multi-agent orchestration workbench
+    "siliconsage/config.capnp",
+    "siliconsage/siliconsage.capnp",
+    "siliconsage/core.js",
+    "siliconsage/agent.js",
+    "siliconsage/orchestrator.js",
+    "siliconsage/cognitive-framework.js",
+    "siliconsage/relevance-realization.js",
+    "siliconsage/four-e-cognition.js",
+    "siliconsage/ways-of-knowing.js",
+    "siliconsage/wisdom-cultivation.js",
+    "siliconsage/binding.js",
+    "siliconsage/demo-worker.js",
+    "siliconsage/sage-config.json",
 ])
