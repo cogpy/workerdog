@@ -5,9 +5,6 @@
  * using the SiliconSage extension for workerd.
  */
 
-import { createAgent } from 'siliconsage:agent';
-import { CognitiveFramework } from 'siliconsage:cognitive-framework';
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
