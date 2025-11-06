@@ -108,7 +108,6 @@ export const cipheriv = {
 
       const tag = cipher.getAuthTag();
 
-      //tag[1] = 0xbb;
 
       const decipher = createDecipheriv(test.name, key, iv);
       decipher.setAuthTag(tag);
