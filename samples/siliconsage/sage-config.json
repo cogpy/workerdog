@@ -1,0 +1,6 @@
+{
+  "name": "SiliconSage Demo",
+  "type": "orchestrator",
+  "maxAgents": 10,
+  "collaborationMode": "peer-to-peer"
+}
